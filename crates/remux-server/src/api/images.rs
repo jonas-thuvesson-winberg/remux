@@ -338,21 +338,114 @@ async fn upload_item_image_inner(
     id: Uuid,
     kind: ImageKind,
     image: api::image::JellyfinImage,
+    query: UploadItemImageQuery,
 ) -> Result<impl IntoResponse> {
-    ImageService::save_image(
+    if kind == ImageKind::Primary {
+        let media = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &id,
+        )
+        .await?
+        .context_not_found("item not found")?;
+        ImageService::save_collection_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            &image.bytes,
+            &media.title,
+            query.remux_add_title,
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .context_internal("failed to save collection image")?;
+    } else {
+        ImageService::save_image(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+            kind,
+            &image.bytes,
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        .context_internal("failed to save image")?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UploadItemImageQuery {
+    #[serde(default)]
+    remux_add_title: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct GenerateCollectionImageQuery {
+    #[serde(default)]
+    add_title: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CollectionImageOptions {
+    add_title: bool,
+}
+
+#[get("/remux/items/{id}/images/primary/options")]
+pub async fn collection_image_options(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse> {
+    Ok(axum::Json(CollectionImageOptions {
+        add_title: ImageService::collection_image_adds_title(
+            &state
+                .ctx
+                .config
+                .data_dir,
+            id,
+        ),
+    }))
+}
+
+#[post("/remux/items/{id}/images/primary/generate")]
+pub async fn generate_collection_image(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+    Query(query): Query<GenerateCollectionImageQuery>,
+) -> Result<impl IntoResponse> {
+    let media = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?
+    .context_not_found("item not found")?;
+    ImageService::generate_collection_image(
         &state
             .ctx
             .config
             .data_dir,
         id,
-        kind,
-        &image.bytes,
+        &media.title,
+        query.add_title,
         &state
             .ctx
             .db,
     )
     .await
-    .context_internal("failed to save image")?;
+    .context_internal("failed to generate collection image")?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -361,9 +454,11 @@ pub async fn upload_item_image(
     State(state): State<AppState>,
     _session: auth::AuthSession,
     Path((id, image_type)): Path<(Uuid, String)>,
+    Query(query): Query<UploadItemImageQuery>,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
-    upload_item_image_inner(state, id, parse_image_kind(&image_type), image).await
+    upload_item_image_inner(state, id, parse_image_kind(&image_type), image, query)
+        .await
 }
 
 #[post("/items/{id}/images/{image_type}/{index}")]
@@ -371,9 +466,11 @@ pub async fn upload_item_image_indexed(
     State(state): State<AppState>,
     _session: auth::AuthSession,
     Path((id, image_type, _index)): Path<(Uuid, String, usize)>,
+    Query(query): Query<UploadItemImageQuery>,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
-    upload_item_image_inner(state, id, parse_image_kind(&image_type), image).await
+    upload_item_image_inner(state, id, parse_image_kind(&image_type), image, query)
+        .await
 }
 
 // --- DELETE ---

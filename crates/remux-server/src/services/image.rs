@@ -132,6 +132,32 @@ impl ImageProcessOptions {
 pub struct ImageService;
 
 impl ImageService {
+    fn collection_source_path(data_dir: &std::path::Path, id: Uuid) -> PathBuf {
+        Self::image_dir(data_dir, id).join("primary-source.jpg")
+    }
+
+    fn collection_title_marker_path(data_dir: &std::path::Path, id: Uuid) -> PathBuf {
+        Self::image_dir(data_dir, id).join("primary-add-title")
+    }
+
+    pub fn collection_image_adds_title(data_dir: &std::path::Path, id: Uuid) -> bool {
+        Self::collection_title_marker_path(data_dir, id).exists()
+    }
+
+    /// Crop an uploaded image to the collection aspect ratio and render its title
+    /// using the same treatment as automatically generated collection images.
+    pub fn render_collection_image(
+        bytes: &[u8],
+        title: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let decoded = image::load_from_memory(bytes)?;
+        let resized = decoded
+            .resize_to_fill(OUT_W, OUT_H, image::imageops::FilterType::Lanczos3)
+            .into_rgb8();
+        let image = draw_label(apply_dark_overlay(resized), title)?;
+        encode_jpeg(image)
+    }
+
     /// Returns the directory for a library item's local images.
     pub fn image_dir(data_dir: &std::path::Path, id: Uuid) -> PathBuf {
         data_dir
@@ -168,7 +194,15 @@ impl ImageService {
             return Ok(tokio::fs::read(&path).await?);
         }
 
-        let bytes = Self::generate(id, name, db).await?;
+        let source = Self::generate(id, name, false, db).await?;
+        let bytes = Self::render_collection_image(&source, name)?;
+        Self::write_image_to_disk(&Self::collection_source_path(data_dir, id), &source)
+            .await?;
+        Self::write_image_to_disk(
+            &Self::collection_title_marker_path(data_dir, id),
+            b"",
+        )
+        .await?;
         Self::write_image_to_disk(&path, &bytes).await?;
         // INSERT OR IGNORE — don't replace if already exists (stable UUID for cache)
         sqlx::query(
@@ -183,6 +217,67 @@ impl ImageService {
         .await?;
 
         Ok(bytes)
+    }
+
+    /// Replace a collection's primary image with a freshly selected background,
+    /// optionally using the standard title overlay.
+    pub async fn generate_collection_image(
+        data_dir: &std::path::Path,
+        id: Uuid,
+        name: &str,
+        add_title: bool,
+        db: &sqlx::SqlitePool,
+    ) -> anyhow::Result<()> {
+        let source_path = Self::collection_source_path(data_dir, id);
+        let source = if add_title && source_path.exists() {
+            tokio::fs::read(&source_path).await?
+        } else if add_title {
+            let images = db::MediaImage::get_for_media(db, &id).await?;
+            match images
+                .primary
+                .first()
+                .filter(|image| {
+                    image
+                        .path
+                        .starts_with('/')
+                }) {
+                Some(image) => tokio::fs::read(&image.path).await?,
+                None => Self::generate(id, name, false, db).await?,
+            }
+        } else {
+            Self::generate(id, name, false, db).await?
+        };
+        Self::save_collection_image(data_dir, id, &source, name, add_title, db).await
+    }
+
+    pub async fn save_collection_image(
+        data_dir: &std::path::Path,
+        id: Uuid,
+        source: &[u8],
+        name: &str,
+        add_title: bool,
+        db: &sqlx::SqlitePool,
+    ) -> anyhow::Result<()> {
+        let source = encode_jpeg(
+            image::load_from_memory(source)?
+                .resize_to_fill(OUT_W, OUT_H, image::imageops::FilterType::Lanczos3)
+                .into_rgb8(),
+        )?;
+        Self::write_image_to_disk(&Self::collection_source_path(data_dir, id), &source)
+            .await?;
+        let bytes = if add_title {
+            Self::render_collection_image(&source, name)?
+        } else {
+            source
+        };
+        Self::save_image(data_dir, id, ImageKind::Primary, &bytes, db).await?;
+        let marker = Self::collection_title_marker_path(data_dir, id);
+        if add_title {
+            Self::write_image_to_disk(&marker, b"").await?;
+        } else {
+            let _ = tokio::fs::remove_file(marker).await;
+        }
+        Ok(())
     }
 
     /// Save an uploaded image for `id`/`image_type`, write to disk, update DB.
@@ -243,6 +338,14 @@ impl ImageService {
                 id,
                 &kind.to_string(),
                 ext,
+            ))
+            .await;
+        }
+        if kind == ImageKind::Primary {
+            let _ = tokio::fs::remove_file(Self::collection_source_path(data_dir, id))
+                .await;
+            let _ = tokio::fs::remove_file(Self::collection_title_marker_path(
+                data_dir, id,
             ))
             .await;
         }
@@ -336,6 +439,7 @@ impl ImageService {
     async fn generate(
         id: Uuid,
         name: &str,
+        add_title: bool,
         db: &sqlx::SqlitePool,
     ) -> anyhow::Result<Vec<u8>> {
         let bg = match find_backdrop_url(id, db).await {
@@ -352,7 +456,7 @@ impl ImageService {
                 }
             }
         };
-        let img = draw_label(bg, name)?;
+        let img = if add_title { draw_label(bg, name)? } else { bg };
         encode_jpeg(img)
     }
 
@@ -651,4 +755,37 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
     }
 
     img
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renders_uploaded_collection_image_at_expected_size() {
+        let source = DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            400,
+            800,
+            Rgb([120, 160, 200]),
+        ));
+        let mut encoded = Cursor::new(Vec::new());
+        source
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode source image");
+
+        let rendered =
+            ImageService::render_collection_image(encoded.get_ref(), "My Collection")
+                .expect("render collection image");
+        let decoded = image::load_from_memory(&rendered).expect("decode result");
+
+        assert_eq!((decoded.width(), decoded.height()), (OUT_W, OUT_H));
+        assert_eq!(detect_content_type(&rendered), "image/jpeg");
+    }
+
+    #[test]
+    fn rejects_invalid_uploaded_collection_image() {
+        assert!(
+            ImageService::render_collection_image(b"not an image", "Title").is_err()
+        );
+    }
 }

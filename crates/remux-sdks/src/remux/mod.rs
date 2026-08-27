@@ -5352,12 +5352,17 @@ pub struct UploadItemImage {
     pub image_type: String,
     pub bytes: Vec<u8>,
     pub content_type: &'static str,
+    /// Remux extension: render the item's title over the uploaded image.
+    pub add_title: bool,
 }
 
 impl Endpoint for UploadItemImage {
     type Output = ();
     fn path(&self) -> String {
-        format!("/Items/{}/Images/{}", self.item_id, self.image_type)
+        format!(
+            "/Items/{}/Images/{}?remux_add_title={}",
+            self.item_id, self.image_type, self.add_title
+        )
     }
     fn method(&self) -> Method {
         Method::POST
@@ -5374,6 +5379,46 @@ impl Endpoint for UploadItemImage {
             self.bytes
                 .clone(),
         )
+    }
+}
+
+/// Replace a collection image with a generated background and optional title.
+#[derive(Debug, Clone)]
+pub struct GenerateCollectionImage {
+    pub item_id: String,
+    pub add_title: bool,
+}
+
+impl Endpoint for GenerateCollectionImage {
+    type Output = ();
+    fn path(&self) -> String {
+        format!(
+            "/remux/items/{}/images/primary/generate?add_title={}",
+            self.item_id, self.add_title
+        )
+    }
+    fn method(&self) -> Method {
+        Method::POST
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionImageOptions {
+    pub add_title: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GetCollectionImageOptions {
+    pub item_id: String,
+}
+
+impl Endpoint for GetCollectionImageOptions {
+    type Output = CollectionImageOptions;
+    fn path(&self) -> String {
+        format!("/remux/items/{}/images/primary/options", self.item_id)
+    }
+    fn method(&self) -> Method {
+        Method::GET
     }
 }
 

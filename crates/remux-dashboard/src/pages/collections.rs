@@ -461,6 +461,24 @@ pub fn CollectionForm(
     let mut pending_image_bytes: Signal<Option<Vec<u8>>> = use_signal(|| None);
     let mut pending_image_preview: Signal<Option<String>> = use_signal(|| None);
     let mut has_image = use_signal(|| existing_image_tag.is_some());
+    let mut add_image_title = use_signal(|| false);
+    let mut image_title_changed = use_signal(|| false);
+    let options_client = app_state.clone();
+    let options_item_id = existing_item_id.clone();
+    use_effect(move || {
+        let client = options_client.clone();
+        let item_id = options_item_id.clone();
+        spawn(async move {
+            if let Some(item_id) = item_id {
+                if let Ok(options) = client
+                    .execute(remux_sdks::remux::GetCollectionImageOptions { item_id })
+                    .await
+                {
+                    add_image_title.set(options.add_title);
+                }
+            }
+        });
+    });
     let client_for_delete = app_state.clone();
     let app_state_delete = app_state.clone();
     let delete_name = existing
@@ -536,6 +554,8 @@ pub fn CollectionForm(
         let pending_bytes = pending_image_bytes
             .peek()
             .clone();
+        let overlay_title = *add_image_title.peek();
+        let regenerate_image = *image_title_changed.peek();
         spawn(async move {
             let result = if let Some(id) = item_id {
                 // Edit existing collection
@@ -568,14 +588,36 @@ pub fn CollectionForm(
                 if patch.is_ok() {
                     if let Some(bytes) = pending_bytes {
                         let ct = crate::state::detect_image_content_type(&bytes);
-                        let _ = client
+                        return match client
                             .execute(remux_sdks::remux::UploadItemImage {
                                 item_id: id,
                                 image_type: "Primary".to_string(),
                                 bytes,
                                 content_type: ct,
+                                add_title: overlay_title,
                             })
-                            .await;
+                            .await
+                        {
+                            Ok(()) => on_done.call(()),
+                            Err(e) => {
+                                err.set(Some(e.user_message()));
+                                saving.set(false);
+                            }
+                        };
+                    } else if regenerate_image {
+                        return match client
+                            .execute(remux_sdks::remux::GenerateCollectionImage {
+                                item_id: id,
+                                add_title: overlay_title,
+                            })
+                            .await
+                        {
+                            Ok(()) => on_done.call(()),
+                            Err(e) => {
+                                err.set(Some(e.user_message()));
+                                saving.set(false);
+                            }
+                        };
                     }
                 }
                 patch
@@ -628,14 +670,22 @@ pub fn CollectionForm(
                 if patch.is_ok() {
                     if let Some(bytes) = pending_bytes {
                         let ct = crate::state::detect_image_content_type(&bytes);
-                        let _ = client
+                        return match client
                             .execute(remux_sdks::remux::UploadItemImage {
                                 item_id: new_id,
                                 image_type: "Primary".to_string(),
                                 bytes,
                                 content_type: ct,
+                                add_title: overlay_title,
                             })
-                            .await;
+                            .await
+                        {
+                            Ok(()) => on_done.call(()),
+                            Err(e) => {
+                                err.set(Some(e.user_message()));
+                                saving.set(false);
+                            }
+                        };
                     }
                 }
                 patch
@@ -783,7 +833,19 @@ pub fn CollectionForm(
                                     "Remove image"
                                 }
                             }
+                            label { style: "display:flex;align-items:center;gap:6px;font-size:.72rem;cursor:pointer;margin-left:auto",
+                                input {
+                                    r#type: "checkbox",
+                                    checked: *add_image_title.read(),
+                                    onchange: move |e| {
+                                        add_image_title.set(e.checked());
+                                        image_title_changed.set(true);
+                                    },
+                                }
+                                "Overlay collection title"
+                            }
                         }
+                        p { class: "field-hint", "The title is applied when the selected image is saved." }
                     }
                 }
             }
