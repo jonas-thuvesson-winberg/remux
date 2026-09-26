@@ -222,9 +222,17 @@ fn send_signal(_pid: u32, _sig: i32) {}
 
 /// Spawn the buffer-throttle task. It pauses/resumes ffmpeg so it never
 /// encodes more than MAX_BUFFER_SECS ahead of what the client has requested.
+///
+/// `start_index` is this run's `-start_number` (see `segment_start_index`):
+/// segment file names are numbered from the seek position, not from 0, so
+/// it must be subtracted from whatever index ffmpeg has reached before
+/// converting to a duration — otherwise a seek into the middle of a long
+/// file reads as already having buffered the seek offset itself and pauses
+/// ffmpeg almost immediately.
 fn spawn_buffer_monitor(
     output_dir: PathBuf,
     segment_length: u32,
+    start_index: u32,
     playback_offset_secs: Arc<AtomicU32>,
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
@@ -241,8 +249,11 @@ fn spawn_buffer_monitor(
             ticks += 1;
 
             let pid = ffmpeg_pid.load(Ordering::Relaxed);
-            let produced = count_segments(&output_dir);
-            let buffered_secs = produced * segment_length;
+            let buffered_secs = buffered_secs_from_segments(
+                highest_segment_index(&output_dir),
+                start_index,
+                segment_length,
+            );
             // playback_offset_secs is how far the client has actually played
             // relative to the start of this transcode session (from progress reports).
             let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
@@ -286,6 +297,19 @@ fn spawn_buffer_monitor(
     });
 }
 
+/// Parses the numeric index out of a segment filename — `segment_00042.ts`,
+/// `segment_00042.m4s`, etc. Extension-agnostic on purpose: HEVC-copy
+/// sessions write fMP4 `.m4s` segments instead of `.ts`, and every caller
+/// here only cares about the index, not the container.
+fn segment_index(name: &str) -> Option<u32> {
+    name.rsplit('_')
+        .next()?
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Delete segment files whose index is less than `cutoff_idx`.
 fn delete_old_segments(dir: &PathBuf, cutoff_idx: u32) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -293,19 +317,7 @@ fn delete_old_segments(dir: &PathBuf, cutoff_idx: u32) {
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let name = name.to_string_lossy();
-        // segment_00042.ts / segment_00042.m4s / etc. — strip everything after the last '_'
-        let Some(idx_str) = name
-            .rsplit('_')
-            .next()
-            .and_then(|s| {
-                s.split('.')
-                    .next()
-            })
-        else {
-            continue;
-        };
-        let Ok(idx) = idx_str.parse::<u32>() else {
+        let Some(idx) = segment_index(&name.to_string_lossy()) else {
             continue;
         };
         if idx < cutoff_idx {
@@ -314,19 +326,47 @@ fn delete_old_segments(dir: &PathBuf, cutoff_idx: u32) {
     }
 }
 
-fn count_segments(dir: &PathBuf) -> u32 {
+/// Highest segment index currently on disk, or `None` if there are no
+/// segments yet. Used instead of a file count so the buffer-ahead
+/// calculation in `spawn_buffer_monitor` stays correct after
+/// `delete_old_segments` starts pruning old segments (file count would
+/// then undercount how far ffmpeg has actually gotten).
+fn highest_segment_index(dir: &PathBuf) -> Option<u32> {
     std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .ends_with(".ts")
-                })
-                .count() as u32
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            segment_index(
+                &e.file_name()
+                    .to_string_lossy(),
+            )
         })
+        .max()
+}
+
+/// The HLS segment index a seek offset lands on — this session's
+/// `-start_number` / `#EXT-X-MEDIA-SEQUENCE` base. Segment files are named
+/// from this index, not from 0, so anything comparing segment indexes across
+/// a seek (the buffer monitor, the playlist) must account for it.
+fn segment_start_index(start_time_ticks: Option<i64>, segment_length: u32) -> u32 {
+    start_time_ticks
+        .map(|t| (t as f64 / 10_000_000.0 / segment_length as f64).floor() as u32)
         .unwrap_or(0)
+}
+
+/// Seconds of ffmpeg output currently buffered, given the highest segment
+/// index found on disk. `start_index` (see `segment_start_index`) must be
+/// subtracted first: segment numbering is absolute (offset by the seek
+/// position), while the buffer-ahead comparison against `playback_secs`
+/// needs a duration relative to where this run started.
+fn buffered_secs_from_segments(
+    highest_index: Option<u32>,
+    start_index: u32,
+    segment_length: u32,
+) -> u32 {
+    highest_index.map_or(0, |idx| {
+        (idx.saturating_sub(start_index) + 1) * segment_length
+    })
 }
 
 /// Parameters for starting a new HLS transcode job.
@@ -1115,12 +1155,8 @@ pub(crate) fn build_hls_args(params: &TranscodeParams) -> Vec<String> {
         .output_dir
         .join(format!("segment_%05d.{}", seg_ext));
 
-    let start_number = params
-        .start_time_ticks
-        .map(|t| {
-            (t as f64 / 10_000_000.0 / params.segment_length as f64).floor() as u32
-        })
-        .unwrap_or(0);
+    let start_number =
+        segment_start_index(params.start_time_ticks, params.segment_length);
 
     args.extend([
         "-f".into(),
@@ -1301,6 +1337,7 @@ pub async fn start_transcode(
                     s.output_dir
                         .clone(),
                     s.segment_length,
+                    segment_start_index(params.start_time_ticks, s.segment_length),
                     s.playback_offset_secs
                         .clone(),
                     ffmpeg_pid.clone(),
@@ -2243,6 +2280,140 @@ mod tests {
     }
     fn all_devices(_: &str) -> bool {
         true
+    }
+
+    #[test]
+    fn segment_index_parses_ts_and_m4s_and_rejects_non_segment_files() {
+        assert_eq!(segment_index("segment_00042.ts"), Some(42));
+        assert_eq!(segment_index("segment_00042.m4s"), Some(42));
+        assert_eq!(segment_index("segment_00000.m4s"), Some(0));
+        assert_eq!(segment_index("init.mp4"), None);
+        assert_eq!(segment_index("playlist.m3u8"), None);
+    }
+
+    #[test]
+    fn highest_segment_index_finds_the_max_across_m4s_segments() {
+        // Regression test for #560: HEVC-copy sessions write .m4s segments,
+        // and the buffer monitor must see them the same as .ts ones.
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "segment_00000.m4s",
+            "segment_00003.m4s",
+            "segment_00001.m4s",
+        ] {
+            std::fs::write(
+                dir.path()
+                    .join(name),
+                b"",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            highest_segment_index(
+                &dir.path()
+                    .to_path_buf()
+            ),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn highest_segment_index_finds_the_max_across_ts_segments() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["segment_00000.ts", "segment_00007.ts", "segment_00002.ts"] {
+            std::fs::write(
+                dir.path()
+                    .join(name),
+                b"",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            highest_segment_index(
+                &dir.path()
+                    .to_path_buf()
+            ),
+            Some(7)
+        );
+    }
+
+    #[test]
+    fn highest_segment_index_is_none_for_an_empty_or_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            highest_segment_index(
+                &dir.path()
+                    .to_path_buf()
+            ),
+            None
+        );
+        assert_eq!(
+            highest_segment_index(&PathBuf::from("/nonexistent/remux-test-dir")),
+            None
+        );
+    }
+
+    #[test]
+    fn segment_start_index_matches_the_seek_offset() {
+        // 1255s seek, 6s segments: floor(1255/6) = 209 — same formula
+        // build_hls_args uses for -start_number.
+        assert_eq!(segment_start_index(Some(1255 * 10_000_000), 6), 209);
+        assert_eq!(segment_start_index(None, 6), 0);
+        assert_eq!(segment_start_index(Some(0), 6), 0);
+    }
+
+    #[test]
+    fn buffered_secs_from_segments_is_relative_to_the_seek_start_index() {
+        // Regression test: a seek to 1255s starts ffmpeg at segment index
+        // ~209 (segment names are absolute, offset by the seek position —
+        // see segment_start_index), not 0. Only one segment has actually
+        // been produced since the seek, so this must read as one
+        // segment_length of buffered output, not 210 segments' worth.
+        assert_eq!(buffered_secs_from_segments(Some(209), 209, 6), 6);
+        assert_eq!(buffered_secs_from_segments(Some(212), 209, 6), 24);
+        // No seek: start_index is 0, matches the old file-count behavior.
+        assert_eq!(buffered_secs_from_segments(Some(3), 0, 6), 24);
+        assert_eq!(buffered_secs_from_segments(None, 0, 6), 0);
+        // Defensive: an index somehow below start_index never underflows.
+        assert_eq!(buffered_secs_from_segments(Some(100), 209, 6), 6);
+    }
+
+    #[test]
+    fn delete_old_segments_prunes_m4s_segments_below_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "segment_00000.m4s",
+            "segment_00001.m4s",
+            "segment_00002.m4s",
+        ] {
+            std::fs::write(
+                dir.path()
+                    .join(name),
+                b"",
+            )
+            .unwrap();
+        }
+        delete_old_segments(
+            &dir.path()
+                .to_path_buf(),
+            2,
+        );
+        let remaining: std::collections::HashSet<String> =
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .map(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+        assert_eq!(
+            remaining,
+            ["segment_00002.m4s".to_string()]
+                .into_iter()
+                .collect()
+        );
     }
 
     #[test]
