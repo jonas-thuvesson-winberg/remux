@@ -5604,6 +5604,90 @@ impl Media {
                 }
             }
 
+            // For genres: count movies and series tagged with them
+            let genre_ids: Vec<Uuid> = records
+                .iter()
+                .filter(|m| m.kind == MediaKind::Genre)
+                .map(|m| m.id)
+                .collect();
+            if !genre_ids.is_empty() {
+                let movie_counts = count_related_items_by_kind(
+                    db,
+                    filter,
+                    is_manual_collection,
+                    use_recursive,
+                    "movie",
+                    &genre_ids,
+                )
+                .await;
+                let series_counts = count_related_items_by_kind(
+                    db,
+                    filter,
+                    is_manual_collection,
+                    use_recursive,
+                    "series",
+                    &genre_ids,
+                )
+                .await;
+                for media in &mut records {
+                    if media.kind == MediaKind::Genre {
+                        let movies = movie_counts
+                            .get(&media.id)
+                            .copied()
+                            .unwrap_or(0);
+                        let series = series_counts
+                            .get(&media.id)
+                            .copied()
+                            .unwrap_or(0);
+                        media.movie_count = Some(movies);
+                        media.series_count = Some(series);
+                        media.child_count = Some(movies + series);
+                    }
+                }
+            }
+
+            // For music genres: count tracks and albums tagged with them
+            let music_genre_ids: Vec<Uuid> = records
+                .iter()
+                .filter(|m| m.kind == MediaKind::MusicGenre)
+                .map(|m| m.id)
+                .collect();
+            if !music_genre_ids.is_empty() {
+                let song_counts = count_related_items_by_kind(
+                    db,
+                    filter,
+                    is_manual_collection,
+                    use_recursive,
+                    "track",
+                    &music_genre_ids,
+                )
+                .await;
+                let album_counts = count_related_items_by_kind(
+                    db,
+                    filter,
+                    is_manual_collection,
+                    use_recursive,
+                    "album",
+                    &music_genre_ids,
+                )
+                .await;
+                for media in &mut records {
+                    if media.kind == MediaKind::MusicGenre {
+                        let songs = song_counts
+                            .get(&media.id)
+                            .copied()
+                            .unwrap_or(0);
+                        let albums = album_counts
+                            .get(&media.id)
+                            .copied()
+                            .unwrap_or(0);
+                        media.song_count = Some(songs);
+                        media.album_count = Some(albums);
+                        media.child_count = Some(songs + albums);
+                    }
+                }
+            }
+
             // For artists: populate album_count and song_count
             let artist_ids: Vec<Uuid> = records
                 .iter()
@@ -7899,6 +7983,128 @@ fn collection_visibility_filters(
         }
     }
     (deny, allow)
+}
+
+/// Prepends the `WITH RECURSIVE subtree` CTE `push_genre_count_scope` needs
+/// for a recursive (folder/library) parent — must run first, since a CTE has
+/// to lead the statement. No-op otherwise.
+fn push_genre_count_recursive_prefix<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>,
+    filter: &'a MediaFilter,
+    use_recursive: bool,
+) {
+    if use_recursive {
+        if let Some(parent_id) = &filter.parent_id {
+            qb.push(
+                "WITH RECURSIVE subtree AS (SELECT id FROM media WHERE parent_id = ",
+            );
+            qb.push_bind(parent_id);
+            qb.push(
+                " UNION ALL SELECT med.id FROM media med \
+                 INNER JOIN subtree s ON med.parent_id = s.id) ",
+            );
+        }
+    }
+}
+
+/// Restricts a genre-related-content count query's counted item (aliased
+/// `m`) to the same parent (recursive subtree or manual-collection
+/// membership), smart-collection filter, and user policy that already
+/// determine which genres are returned in the first place (see
+/// `is_genre_scope_query` in `get_by_filter_inner`) — otherwise a genre
+/// scoped to one collection/library reports counts across the whole
+/// database. Call `push_genre_count_recursive_prefix` first when
+/// `use_recursive` is set.
+fn push_genre_count_scope<'a>(
+    qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>,
+    filter: &'a MediaFilter,
+    is_manual_collection: bool,
+    use_recursive: bool,
+) {
+    if use_recursive
+        && filter
+            .parent_id
+            .is_some()
+    {
+        qb.push(" AND m.id IN (SELECT id FROM subtree)");
+    } else if is_manual_collection {
+        if let Some(collection_id) = &filter.parent_id {
+            qb.push(
+                " AND m.id IN (SELECT right_media_id FROM media_relations \
+                 WHERE left_media_id = ",
+            );
+            qb.push_bind(collection_id);
+            qb.push(" AND role = 'collection')");
+        }
+    }
+    if let Some(rules) = &filter.filter_rules {
+        qb.push(" AND m.id IN (SELECT media.id FROM media WHERE 1=1");
+        apply_filter_rules(
+            qb,
+            rules,
+            filter
+                .user_id
+                .as_ref(),
+            false,
+        );
+        qb.push(")");
+    }
+    if let Some(pf) = &filter.policy_filter {
+        qb.push(" AND m.id IN (SELECT media.id FROM media WHERE 1=1");
+        apply_filter_rules(
+            qb,
+            pf,
+            filter
+                .user_id
+                .as_ref(),
+            false,
+        );
+        qb.push(")");
+    }
+}
+
+/// Counts distinct `item_kind` content items related (via `media_relations`)
+/// to each id in `ids`, applying the same scope as `push_genre_count_scope`.
+/// Used to fill in `movie_count`/`series_count` (Genre) and
+/// `song_count`/`album_count` (MusicGenre) in `get_by_filter_inner`. An id
+/// with no matching relation simply isn't in the returned map — callers
+/// default that to 0.
+async fn count_related_items_by_kind(
+    db: &SqlitePool,
+    filter: &MediaFilter,
+    is_manual_collection: bool,
+    use_recursive: bool,
+    item_kind: &str,
+    ids: &[Uuid],
+) -> HashMap<Uuid, i64> {
+    let mut qb = sqlx::QueryBuilder::new("");
+    push_genre_count_recursive_prefix(&mut qb, filter, use_recursive);
+    qb.push(
+        "SELECT mr.right_media_id, COUNT(DISTINCT mr.left_media_id) \
+         FROM media_relations mr \
+         JOIN media m ON m.id = mr.left_media_id AND m.kind = ",
+    );
+    qb.push_bind(item_kind);
+    qb.push(" WHERE mr.right_media_id IN (");
+    let mut sep = qb.separated(", ");
+    for id in ids {
+        sep.push_bind(id);
+    }
+    qb.push(")");
+    push_genre_count_scope(&mut qb, filter, is_manual_collection, use_recursive);
+    qb.push(" GROUP BY mr.right_media_id");
+
+    let mut map = HashMap::new();
+    if let Ok(rows) = qb
+        .build()
+        .fetch_all(db)
+        .await
+    {
+        for row in rows {
+            map.insert(row.get(0), row.get(1));
+        }
+    }
+    map
 }
 
 /// Append WHERE clauses for a set of `FilterRule`s onto a query builder.
