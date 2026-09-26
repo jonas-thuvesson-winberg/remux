@@ -44,19 +44,15 @@ pub struct PlaybackSession {
 #[derive(Clone)]
 pub struct PlaybackSessionManager {
     sessions: Arc<DashMap<String, PlaybackSession>>,
-    /// Playback methods selected before the client's playback-start report.
-    /// Each entry is consumed when its session is inserted.
-    pending_play_methods: Arc<DashMap<String, (DateTime<Utc>, PlayMethod)>>,
-    // Makes the effective-method handoff atomic when the stream request and
-    // playback-start report race each other.
-    play_method_handoff: Arc<std::sync::Mutex<()>>,
     // Requests can arrive before the client's playback-start report. Hold
-    // their leases briefly, then move them into the PlaybackSession on start.
+    // their leases and the play method they actually served briefly, then
+    // move them into the PlaybackSession on start.
     pending_torrents:
         Arc<DashMap<String, (DateTime<Utc>, Vec<Arc<crate::torrent::TorrentLease>>)>>,
+    pending_play_methods: Arc<DashMap<String, (DateTime<Utc>, PlayMethod)>>,
     // Makes that handoff atomic: a request cannot be stranded in pending
     // while playback-start inserts its session.
-    torrent_handoff: Arc<std::sync::Mutex<()>>,
+    handoff: Arc<std::sync::Mutex<()>>,
     base_dir: PathBuf,
 }
 
@@ -66,10 +62,9 @@ impl PlaybackSessionManager {
         let _ = std::fs::create_dir_all(&base_dir);
         Self {
             sessions: Arc::new(DashMap::new()),
-            pending_play_methods: Arc::new(DashMap::new()),
-            play_method_handoff: Arc::new(std::sync::Mutex::new(())),
             pending_torrents: Arc::new(DashMap::new()),
-            torrent_handoff: Arc::new(std::sync::Mutex::new(())),
+            pending_play_methods: Arc::new(DashMap::new()),
+            handoff: Arc::new(std::sync::Mutex::new(())),
             base_dir,
         }
     }
@@ -95,23 +90,23 @@ impl PlaybackSessionManager {
                     .to_string()
             });
 
-        let reported_play_method =
-            if let Some(method) = self.pending_play_method(&play_session_id) {
-                Some(method)
-            } else if let Some(method) = data
-                .play_method
-                .clone()
-            {
+        // A method already recorded by a stream endpoint overrides this in
+        // `insert`; until then, don't trust a method the server can't use.
+        let reported_play_method = match data
+            .play_method
+            .clone()
+        {
+            Some(method) => {
                 let encoding = db::Settings::get_encoding_config(db)
                     .await
                     .unwrap_or_default();
-                let method =
+                Some(
                     PlaybackPermissions::for_user(&encoding, Some(&auth_session.user))
-                        .constrain_reported_method(method);
-                Some(method)
-            } else {
-                None
-            };
+                        .constrain_reported_method(method),
+                )
+            }
+            None => None,
+        };
 
         // Enforce per-user concurrent-stream limit.
         let max_sessions = auth_session
@@ -645,9 +640,9 @@ impl PlaybackSessionManager {
             }
         }
         let _handoff = self
-            .torrent_handoff
+            .handoff
             .lock()
-            .expect("torrent handoff lock is not poisoned");
+            .expect("handoff lock is not poisoned");
         if let Some((_, (_, pending))) = self
             .pending_torrents
             .remove(&session.play_session_id)
@@ -665,10 +660,6 @@ impl PlaybackSessionManager {
                     .clone(),
             );
         }
-        let _method_handoff = self
-            .play_method_handoff
-            .lock()
-            .expect("play method handoff lock is poisoned");
         if let Some((_, (_, method))) = self
             .pending_play_methods
             .remove(&session.play_session_id)
@@ -767,45 +758,30 @@ impl PlaybackSessionManager {
     /// only an unclaimed HLS stub exists, keep the method pending for `start`.
     pub fn record_server_play_method(&self, id: &str, method: PlayMethod) {
         let _handoff = self
-            .play_method_handoff
+            .handoff
             .lock()
-            .expect("play method handoff lock is poisoned");
-        if let Some(mut session) = self
+            .expect("handoff lock is not poisoned");
+        // HLS may attach an unclaimed transcode stub (nil user/item) before
+        // the playback-start report; keep the method pending for that too.
+        let claimed = self
             .sessions
             .get_mut(id)
-        {
-            session.play_method = Some(method.to_string());
-            if session
-                .user_id
-                .is_nil()
-                && session
-                    .item_id
+            .is_some_and(|mut session| {
+                session.play_method = Some(method.to_string());
+                !(session
+                    .user_id
                     .is_nil()
-            {
-                // HLS may attach an unclaimed transcode stub before the
-                // playback-start report. Keep the method pending so the real
-                // session insertion inherits it when it replaces the stub.
-                self.pending_play_methods
-                    .insert(id.to_string(), (Utc::now(), method));
-            } else {
-                self.pending_play_methods
-                    .remove(id);
-            }
+                    && session
+                        .item_id
+                        .is_nil())
+            });
+        if claimed {
+            self.pending_play_methods
+                .remove(id);
         } else {
             self.pending_play_methods
                 .insert(id.to_string(), (Utc::now(), method));
         }
-    }
-
-    fn pending_play_method(&self, id: &str) -> Option<PlayMethod> {
-        self.pending_play_methods
-            .get(id)
-            .map(|entry| {
-                entry
-                    .value()
-                    .1
-                    .clone()
-            })
     }
 
     /// Update `last_activity` on the session.
@@ -914,21 +890,16 @@ impl PlaybackSessionManager {
     pub async fn stop(&self, id: &str) -> Option<PlaybackSession> {
         // Also release references captured before a playback-start report.
         let _handoff = self
-            .torrent_handoff
+            .handoff
             .lock()
-            .expect("torrent handoff lock is not poisoned");
+            .expect("handoff lock is not poisoned");
         self.pending_torrents
             .remove(id);
-        let _method_handoff = self
-            .play_method_handoff
-            .lock()
-            .expect("play method handoff lock is poisoned");
         self.pending_play_methods
             .remove(id);
         let (_, session) = self
             .sessions
             .remove(id)?;
-        drop(_method_handoff);
         drop(_handoff);
         if let Some(ts) = session
             .transcode
@@ -954,9 +925,9 @@ impl PlaybackSessionManager {
             .acquire(hash)
             .await;
         let _handoff = self
-            .torrent_handoff
+            .handoff
             .lock()
-            .expect("torrent handoff lock is not poisoned");
+            .expect("handoff lock is not poisoned");
         if let Some(mut session) = self
             .sessions
             .get_mut(id)
@@ -1053,15 +1024,11 @@ impl PlaybackSessionManager {
                 // not retain a torrent forever. Active responses still own
                 // their own reference when this pending entry expires.
                 let _handoff = self
-                    .torrent_handoff
+                    .handoff
                     .lock()
-                    .expect("torrent handoff lock is not poisoned");
+                    .expect("handoff lock is not poisoned");
                 self.pending_torrents
                     .retain(|_, (seen, _)| *seen >= cutoff);
-                let _method_handoff = self
-                    .play_method_handoff
-                    .lock()
-                    .expect("play method handoff lock is poisoned");
                 self.pending_play_methods
                     .retain(|_, (seen, _)| *seen >= cutoff);
             }
@@ -1162,7 +1129,11 @@ mod tests {
                 .and_then(|session| session.play_method),
             Some(PlayMethod::Transcode.to_string())
         );
-        assert_eq!(sessions.pending_play_method(id), None);
+        assert!(
+            !sessions
+                .pending_play_methods
+                .contains_key(id)
+        );
 
         sessions
             .insert(playback_session(id, PlayMethod::DirectStream))
@@ -1193,7 +1164,11 @@ mod tests {
                 .and_then(|session| session.play_method),
             Some(PlayMethod::Transcode.to_string())
         );
-        assert_eq!(sessions.pending_play_method(id), None);
+        assert!(
+            !sessions
+                .pending_play_methods
+                .contains_key(id)
+        );
     }
 
     #[tokio::test]
@@ -1209,9 +1184,10 @@ mod tests {
             .insert(stub)
             .await;
         sessions.record_server_play_method(id, PlayMethod::Transcode);
-        assert_eq!(
-            sessions.pending_play_method(id),
-            Some(PlayMethod::Transcode)
+        assert!(
+            sessions
+                .pending_play_methods
+                .contains_key(id)
         );
 
         sessions
@@ -1223,6 +1199,10 @@ mod tests {
                 .and_then(|session| session.play_method),
             Some(PlayMethod::Transcode.to_string())
         );
-        assert_eq!(sessions.pending_play_method(id), None);
+        assert!(
+            !sessions
+                .pending_play_methods
+                .contains_key(id)
+        );
     }
 }

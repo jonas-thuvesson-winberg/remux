@@ -51,10 +51,11 @@ impl PlaybackPermissions {
         }
     }
 
-    /// Resolve client-requested codecs and subtitle burn-in through the
-    /// server/user permissions. Disabled encoders become stream-copy requests.
-    /// If that leaves a pure remux while remuxing is disabled, the caller must
-    /// serve the source via direct play instead of starting FFmpeg.
+    /// Resolve requested codecs and subtitle burn-in through the server/user
+    /// permissions. Video resolves to `copy` or `h264` (burn-in forces a
+    /// re-encode); disabled encoders become stream-copy requests. If that
+    /// leaves a pure remux while remuxing is disabled, the caller must serve
+    /// the source via direct play instead of starting FFmpeg.
     pub(crate) fn resolve_codecs(
         self,
         requested_video: &str,
@@ -62,16 +63,14 @@ impl PlaybackPermissions {
         subtitle_burn_requested: bool,
     ) -> ResolvedPlaybackCodecs {
         let burn_subtitle = subtitle_burn_requested && self.video_transcoding;
-        let requested_video = if burn_subtitle {
+        let video = if burn_subtitle
+            || (!codec_is_copy(requested_video) && self.video_transcoding)
+        {
             "h264"
         } else {
-            requested_video
-        };
-        let video = if codec_is_copy(requested_video) || !self.video_transcoding {
-            "copy".to_string()
-        } else {
-            requested_video.to_string()
-        };
+            "copy"
+        }
+        .to_string();
         let audio = if codec_is_copy(requested_audio) || !self.audio_transcoding {
             "copy".to_string()
         } else {
@@ -113,6 +112,18 @@ pub(crate) struct ResolvedPlaybackCodecs {
     pub audio: String,
     pub direct_play_only: bool,
     pub burn_subtitle: bool,
+}
+
+/// The play method a stream endpoint actually serves for the given codecs.
+pub(crate) fn play_method_for_codecs(
+    video_codec: &str,
+    audio_codec: &str,
+) -> PlayMethod {
+    if codec_is_copy(video_codec) && codec_is_copy(audio_codec) {
+        PlayMethod::DirectStream
+    } else {
+        PlayMethod::Transcode
+    }
 }
 
 fn codec_is_copy(codec: &str) -> bool {
@@ -191,19 +202,8 @@ pub(crate) fn build_transcode_decision(
         .video_stream()
         .is_some();
     if has_audio && !has_video {
-        let requested_audio_codec = cfg
-            .device_profile
-            .as_ref()
-            .and_then(|p| p.audio_transcoding_profile())
-            .and_then(|p| {
-                p.audio_codec
-                    .as_ref()
-            })
-            .and_then(|c| c.first())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| "aac".to_string());
-        let codecs = permissions.resolve_codecs("copy", &requested_audio_codec, false);
-        if codecs.direct_play_only {
+        // Without audio transcoding this would be a pure remux.
+        if !permissions.audio_transcoding && !permissions.remuxing {
             return TranscodeDecision::DirectPlay;
         }
         return TranscodeDecision::Transcode(build_audio_transcode(
@@ -211,7 +211,7 @@ pub(crate) fn build_transcode_decision(
             q,
             session,
             cfg,
-            &codecs.audio,
+            permissions.audio_transcoding,
         ));
     }
     build_video_transcode(
@@ -230,7 +230,7 @@ fn build_audio_transcode(
     q: &api::PlaybackInfoQuery,
     session: &db::auth::AuthSession,
     cfg: &PlaybackConfig,
-    audio_codec: &str,
+    audio_transcoding: bool,
 ) -> TranscodeOutcome {
     let trans_profile = cfg
         .device_profile
@@ -243,6 +243,18 @@ fn build_audio_transcode(
                 .map(|c| c.to_string())
         })
         .unwrap_or_else(|| "mp3".to_string());
+    let audio_codec = if audio_transcoding {
+        trans_profile
+            .and_then(|p| {
+                p.audio_codec
+                    .as_ref()
+            })
+            .and_then(|c| c.first())
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "aac".to_string())
+    } else {
+        "copy".to_string()
+    };
     let start_time = q
         .start_time_ticks
         .map(|t| format!("&StartTimeTicks={t}"))
@@ -299,46 +311,36 @@ fn build_video_transcode(
         .iter()
         .any(api::TranscodeReason::is_video)
         || reasons.contains(&api::TranscodeReason::ContainerBitrateExceedsLimit);
-
-    // When video re-encoding is not allowed (server setting or user policy),
-    // fall through with video=copy — remux the container and transcode audio
-    // as needed rather than dropping the source entirely.
-    let mut video_codec = if needs_video_transcode && permissions.video_transcoding {
-        "h264"
-    } else {
-        "copy"
-    }
-    .to_string();
     let needs_audio_transcode = reasons
         .0
         .iter()
         .any(api::TranscodeReason::is_audio);
-    let audio_codec = if needs_audio_transcode && permissions.audio_transcoding {
-        "aac"
-    } else {
-        "copy"
-    }
-    .to_string();
+    let subtitle_method = subtitle_burn_method(
+        source,
+        effective_sub_idx,
+        &cfg.subtitle_mode,
+        &cfg.device_profile,
+    );
 
-    let subtitle_method = {
-        let method = subtitle_burn_method(
-            source,
-            effective_sub_idx,
-            &cfg.subtitle_mode,
-            &cfg.device_profile,
-        );
-        if method == Some(api::SubtitleDeliveryMethod::Encode) {
-            if permissions.video_transcoding {
-                video_codec = "h264".to_string();
-                method
-            } else {
-                // Burn-in requires video re-encoding; drop it when encoding is disabled.
-                None
-            }
+    // When an encoder is not allowed (server setting or user policy), fall
+    // through with copy — remux the container and transcode the other stream
+    // as needed rather than dropping the source entirely.
+    let codecs = permissions.resolve_codecs(
+        if needs_video_transcode {
+            "h264"
         } else {
-            method
-        }
-    };
+            "copy"
+        },
+        if needs_audio_transcode { "aac" } else { "copy" },
+        subtitle_method == Some(api::SubtitleDeliveryMethod::Encode),
+    );
+    if codecs.direct_play_only {
+        return TranscodeDecision::DirectPlay;
+    }
+    // Burn-in requires video re-encoding; drop it when encoding is disabled.
+    let subtitle_method = subtitle_method
+        .filter(|m| *m != api::SubtitleDeliveryMethod::Encode || codecs.burn_subtitle);
+    let (video_codec, audio_codec) = (codecs.video, codecs.audio);
 
     // If policy constraints reduced both codecs to copy, this would be a no-op
     // remux. If the source container already matches the transcoding target
@@ -362,13 +364,6 @@ fn build_video_transcode(
         if src == container.to_lowercase() {
             return TranscodeDecision::DirectPlay;
         }
-    }
-
-    if permissions
-        .resolve_codecs(&video_codec, &audio_codec, false)
-        .direct_play_only
-    {
-        return TranscodeDecision::DirectPlay;
     }
 
     let bitrate = cfg

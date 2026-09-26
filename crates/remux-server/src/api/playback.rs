@@ -47,7 +47,7 @@ use crate::{
     playback::{
         decision::{
             PlaybackConfig, PlaybackPermissions, TranscodeDecision,
-            apply_subtitle_delivery, build_transcode_decision,
+            apply_subtitle_delivery, build_transcode_decision, play_method_for_codecs,
         },
         session::{TranscodeSession, TranscodeState},
     },
@@ -1216,6 +1216,17 @@ async fn videos_stream_inner(
         }
     }
 
+    // Record what this endpoint actually serves; the client's report may differ.
+    let sessions = state
+        .ctx
+        .sessions
+        .clone();
+    let record_play_method = |method: PlayMethod| {
+        if let Some(playback_id) = playback_id.as_deref() {
+            sessions.record_server_play_method(playback_id, method);
+        }
+    };
+
     // Direct play: serve bytes directly through the StreamSource trait.
     // This handles HTTP, local files, torrents, and opendal without going through
     // our own HTTP proxy — TorrentSource resolves and streams inline.
@@ -1223,12 +1234,7 @@ async fn videos_stream_inner(
         .unwrap_or(false)
         || resolved_codecs.direct_play_only
     {
-        if let Some(playback_id) = playback_id.as_deref() {
-            state
-                .ctx
-                .sessions
-                .record_server_play_method(playback_id, PlayMethod::DirectPlay);
-        }
+        record_play_method(PlayMethod::DirectPlay);
         // If the producing addon has http_redirect_stream enabled, issue a 302
         // directly to the stream URL instead of proxying bytes through remux —
         // unless the URL's host is only reachable from remux's own network, in
@@ -1302,12 +1308,7 @@ async fn videos_stream_inner(
         .as_deref()
         .unwrap_or("mp4")
         .to_string();
-    let video_codec = if resolved_codecs.video == "copy" {
-        "copy"
-    } else {
-        "h264"
-    }
-    .to_string();
+    let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     // Keep a copy before the video_codec is moved into params (needed for Content-Type logic)
     let is_copy_video = video_codec == "copy";
@@ -1379,12 +1380,7 @@ async fn videos_stream_inner(
             .unwrap_or(0)
             == 0
     {
-        if let Some(playback_id) = playback_id.as_deref() {
-            state
-                .ctx
-                .sessions
-                .record_server_play_method(playback_id, PlayMethod::DirectPlay);
-        }
+        record_play_method(PlayMethod::DirectPlay);
         let resp = if let Some(addon_id) = descriptor.addon_id() {
             let addon = state
                 .ctx
@@ -1407,17 +1403,7 @@ async fn videos_stream_inner(
         return Ok(resp.into_response());
     }
 
-    if let Some(playback_id) = playback_id.as_deref() {
-        let effective_method = if video_codec == "copy" && audio_codec == "copy" {
-            PlayMethod::DirectStream
-        } else {
-            PlayMethod::Transcode
-        };
-        state
-            .ctx
-            .sessions
-            .record_server_play_method(playback_id, effective_method);
-    }
+    record_play_method(play_method_for_codecs(&video_codec, &audio_codec));
 
     let params = crate::playback::engine::ProgressiveTranscodeParams {
         input_url: url,

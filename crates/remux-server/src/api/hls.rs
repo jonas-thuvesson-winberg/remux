@@ -13,7 +13,7 @@ use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-use remux_sdks::remux::{AudioCodec, HardwareAccelerationType, PlayMethod};
+use remux_sdks::remux::{AudioCodec, HardwareAccelerationType};
 
 use crate::{
     AppState, IntoApiError, OptionExt, ResultExt, api, common,
@@ -21,7 +21,7 @@ use crate::{
     db,
     db::auth,
     playback::{
-        decision::PlaybackPermissions,
+        decision::{PlaybackPermissions, play_method_for_codecs},
         hw_accel,
         session::{TranscodeSession, TranscodeState},
     },
@@ -35,16 +35,8 @@ static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
 
 enum HlsSessionResult {
     Transcode(Arc<tokio::sync::RwLock<TranscodeSession>>, String),
-    RemuxForbidden,
-    AudioTranscodeForbidden,
-}
-
-fn play_method_for_codecs(video_codec: &str, audio_codec: &str) -> PlayMethod {
-    if video_codec == "copy" && audio_codec == "copy" {
-        PlayMethod::DirectStream
-    } else {
-        PlayMethod::Transcode
-    }
+    /// The request needs processing the server or user policy disallows.
+    Forbidden(&'static str),
 }
 
 /// Shared session setup: look up or create the transcode session for an HLS
@@ -101,13 +93,11 @@ async fn create_hls_session(
                 .stop_transcode(&play_session_id)
                 .await;
         }
-        return Ok(HlsSessionResult::RemuxForbidden);
+        return Ok(HlsSessionResult::Forbidden(
+            "HLS playback requires remuxing",
+        ));
     }
-    let video_codec = if resolved_codecs.video == "copy" {
-        "copy".to_string()
-    } else {
-        "h264".to_string()
-    };
+    let video_codec = resolved_codecs.video;
     let audio_codec = resolved_codecs.audio;
     let burn_subtitle = resolved_codecs.burn_subtitle;
     let segment_length = q
@@ -344,7 +334,9 @@ async fn create_hls_session(
             &audio_codec,
         );
         if resolved_audio_codec != audio_codec && !permissions.audio_transcoding {
-            return Ok(HlsSessionResult::AudioTranscodeForbidden);
+            return Ok(HlsSessionResult::Forbidden(
+                "HLS playback requires audio transcoding",
+            ));
         }
         let audio_codec = resolved_audio_codec;
 
@@ -462,7 +454,6 @@ async fn create_hls_session(
             output_dir,
             video_codec.clone(),
             audio_codec.clone(),
-            permissions.audio_transcoding,
             q.audio_stream_index
                 .map(|v| v as i32)
                 .filter(|&v| v >= 0),
@@ -508,7 +499,6 @@ async fn create_hls_session(
                 .clone(),
             video_codec: video_codec.clone(),
             audio_codec: audio_codec.clone(),
-            audio_transcoding_allowed: permissions.audio_transcoding,
             segment_length,
             start_time_ticks: q.start_time_ticks,
             max_width: q
@@ -678,13 +668,8 @@ pub async fn master_hls_video(
     debug!("master_hls_video: item_id={}, q={:?}", id, q);
     let session = match create_hls_session(&state, &auth, id, &q).await {
         Ok(HlsSessionResult::Transcode(session, _)) => session,
-        Ok(HlsSessionResult::RemuxForbidden) => {
-            return Err(anyhow::anyhow!("HLS remuxing is disabled")
-                .context_forbidden("HLS playback requires remuxing"));
-        }
-        Ok(HlsSessionResult::AudioTranscodeForbidden) => {
-            return Err(anyhow::anyhow!("HLS audio transcoding is disabled")
-                .context_forbidden("HLS playback requires audio transcoding"));
+        Ok(HlsSessionResult::Forbidden(detail)) => {
+            return Err(anyhow::anyhow!("Forbidden").context_forbidden(detail));
         }
         Err(_) => {
             return Ok(axum::response::Redirect::temporary("/videos/no-streams")
@@ -717,19 +702,12 @@ pub async fn live_hls_video(
     debug!("live_hls_video: item_id={}, q={:?}", id, q);
     let play_session_id = match create_hls_session(&state, &auth, id, &q).await? {
         HlsSessionResult::Transcode(_, play_session_id) => play_session_id,
-        HlsSessionResult::RemuxForbidden => {
-            return Err(anyhow::anyhow!("HLS remuxing is disabled")
-                .context_forbidden("HLS playback requires remuxing"));
-        }
-        HlsSessionResult::AudioTranscodeForbidden => {
-            return Err(anyhow::anyhow!("HLS audio transcoding is disabled")
-                .context_forbidden("HLS playback requires audio transcoding"));
+        HlsSessionResult::Forbidden(detail) => {
+            return Err(anyhow::anyhow!("Forbidden").context_forbidden(detail));
         }
     };
     q.play_session_id = Some(play_session_id);
-    Ok(variant_hls_video_inner(state, q)
-        .await?
-        .into_response())
+    variant_hls_video_inner(state, q).await
 }
 
 /// Variant HLS playlist - alternate URL used by some clients.
@@ -1201,7 +1179,6 @@ async fn hls_segment_inner(
                     let audio_codec = s
                         .audio_codec
                         .clone();
-                    let audio_transcoding_allowed = s.audio_transcoding_allowed;
                     let audio_stream_index = s.audio_stream_index;
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
@@ -1253,7 +1230,6 @@ async fn hls_segment_inner(
                         output_dir: output_dir.clone(),
                         video_codec,
                         audio_codec: audio_codec.clone(),
-                        audio_transcoding_allowed,
                         segment_length,
                         start_time_ticks: Some(start_time_ticks),
                         max_width: q
@@ -1409,19 +1385,7 @@ async fn hls_segment_inner(
 
 #[cfg(test)]
 mod tests {
-    use remux_sdks::remux::{PlayMethod, VideoContainer};
-
-    #[test]
-    fn hls_audio_conversion_is_reported_as_transcode() {
-        assert_eq!(
-            super::play_method_for_codecs("copy", "copy"),
-            PlayMethod::DirectStream
-        );
-        assert_eq!(
-            super::play_method_for_codecs("copy", "aac"),
-            PlayMethod::Transcode
-        );
-    }
+    use remux_sdks::remux::VideoContainer;
 
     #[test]
     fn vod_hls_source_reencodes_copied_audio_to_aac() {
