@@ -1,0 +1,41 @@
+name: Docker Cleanup
+
+on:
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Tags to delete, comma-separated, wildcards allowed (e.g. sha-*, pr-*, sha-3ac32e2). Leave empty to only remove orphaned untagged images.'
+        required: false
+        default: ''
+      older_than:
+        description: 'Only delete images older than this (e.g. 14 days, 2 months). Leave empty for no age limit.'
+        required: false
+        default: ''
+      exclude_tags:
+        description: 'Tags that are never deleted, comma-separated'
+        required: false
+        default: 'latest,nightly'
+      dry_run:
+        description: 'Only log what would be deleted'
+        type: boolean
+        default: false
+
+permissions:
+  packages: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      # Multi-arch aware: deleting a tag also removes its per-platform images,
+      # and delete-untagged only removes untagged images that no remaining tag
+      # references, so it never breaks a tagged image.
+      - name: Clean up ghcr.io/${{ github.repository_owner }}/remux
+        uses: dataaxiom/ghcr-cleanup-action@v1
+        with:
+          package: remux
+          delete-tags: ${{ inputs.tags }}
+          exclude-tags: ${{ inputs.exclude_tags }}
+          older-than: ${{ inputs.older_than }}
+          delete-untagged: true
+          dry-run: ${{ inputs.dry_run }}
